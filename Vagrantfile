@@ -10,14 +10,35 @@ Vagrant.configure("2") do |config|
   config.vm.define "openvpn" do |openvpn|
     openvpn.vm.box = "centos/7"
     openvpn.vm.network "private_network", ip: "192.168.50.11"
-    openvpn.vm.network "forwarded_port", guest: 1194, host: 1194
+
+    openvpn.vm.provision "shell", inline: <<-SHELL
+      # sudo /vagrant/openvpn-install.sh
+      cp /root/client.ovpn /vagrant/
+    SHELL
+
   end
 
-  config.vm.define "target" do |target|
-    target.vm.box = "centos/7"
-    target.vm.network "private_network", ip: "192.168.50.12"
+  config.vm.define "client" do |client|
+    client.vm.box = "centos/7"
+    client.vm.network "private_network", ip: "192.168.50.12"
+
+    server.vm.provision "shell", inline: <<-SHELL
+      sudo yum install epel-release openvpn -y
+    SHELL
+
   end
-  
+
+  config.vm.define "server" do |server|
+    server.vm.box = "centos/7"
+    server.vm.network "private_network", ip: "192.168.50.13"
+
+    server.vm.provision "shell", inline: <<-SHELL
+      sudo yum install -y apache2
+      sudo bash -c "echo 'Hello world' > /var/www/public_html/index.html
+    SHELL
+
+  end
+
   # The most common configuration options are documented and commented below.
   # For a complete reference, please see the online documentation at
   # https://docs.vagrantup.com.

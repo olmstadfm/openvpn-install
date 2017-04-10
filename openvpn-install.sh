@@ -9,7 +9,7 @@
 
 log () {
     local red='\033[0;31m'
-    local  nc='\033[0m' 
+    local  nc='\033[0m'
     echo -e "${red}$1${nc}"
 }
 
@@ -27,7 +27,9 @@ detect_linux_distribution () {
     fi
 }
 
+################################################################################
 # Assumptions made about environment
+################################################################################
 
 assume_run_by_bash () {
     # Detect Debian users running the script with "sh" instead of bash
@@ -71,7 +73,9 @@ check_environment () {
     assume_distribution_supported
 }
 
+################################################################################
 # Setup variables
+################################################################################
 
 setup_variables () {
     # Try to get our IP from the system and fallback to the Internet.
@@ -89,10 +93,12 @@ setup_variables () {
 	centos)
 	    GROUPNAME=nobody
 	    RCLOCAL='/etc/rc.d/rc.local' ;;
-    esac	    
+    esac
 }
 
+################################################################################
 # Firewall
+################################################################################
 
 firewalld_enabled () {
     if pgrep firewalld; then
@@ -111,10 +117,12 @@ rclocal_create () {
     chmod +x $RCLOCAL
 }
 
+# --- IP forwarding ------------------------------------------------------------
+
 firewall_ip_forwarding_enable () {
 
     log firewall_ip_forwarding_enable
-    
+
     # Enable net.ipv4.ip_forward for the system
     sed -i '/\<net.ipv4.ip_forward\>/c\net.ipv4.ip_forward=1' /etc/sysctl.conf
     if ! grep -q "\<net.ipv4.ip_forward\>" /etc/sysctl.conf; then
@@ -122,86 +130,207 @@ firewall_ip_forwarding_enable () {
     fi
     # Avoid an unneeded reboot
     echo 1 > /proc/sys/net/ipv4/ip_forward
-}    
+}
+
+# --- Open port ----------------------------------------------------------------
+
+firewalld_port_open_until_reboot () {
+    firewall-cmd --zone=public --add-port=$PORT/$PROTOCOL
+    firewall-cmd --zone=trusted --add-source=10.8.0.0/24
+}
+
+firewalld_port_open_permanent () {
+    firewall-cmd --permanent --zone=public --add-port=$PORT/$PROTOCOL
+    firewall-cmd --permanent --zone=trusted --add-source=10.8.0.0/24
+}
+
+iptables_port_open_until_reboot () {
+    if iptables -L -n | grep -qE '^(REJECT|DROP)'; then
+	# If iptables has at least one REJECT rule, we asume this is needed.
+	# Not the best approach but I can't think of other and this shouldn't
+	# cause problems.
+	iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT
+	iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT
+	iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+    fi
+}
+
+iptables_port_open_permanent () {
+    if iptables -L -n | grep -qE '^(REJECT|DROP)'; then
+	# If iptables has at least one REJECT rule, we asume this is needed.
+	# Not the best approach but I can't think of other and this shouldn't
+	# cause problems.
+	sed -i "1 a\iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT" $RCLOCAL
+	sed -i "1 a\iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT" $RCLOCAL
+	sed -i "1 a\iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" $RCLOCAL
+    fi
+}
+
+firewall_port_open_until_reboot () {
+    if firewalld_enabled ; then
+	firewalld_port_open_until_reboot
+    else
+	iptables_port_open_until_reboot
+    fi
+}
+
+firewall_port_open_permanent () {
+    if firewalld_enabled ; then
+	firewalld_port_open_permanent
+    else
+	iptables_port_open_permanent
+    fi
+}
 
 firewall_port_open () {
     log firewall_port_open
 
-    log "PORT IS $PORT. PROTOCOL IS $PROTOCOL"
-    
+    firewall_port_open_until_reboot
+    firewall_port_open_permanent
+}
+
+# --- Port close ---------------------------------------------------------------
+
+firewalld_port_close_until_reboot () {
+
+    # @todo unused variable
+    IP=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 -j SNAT --to ' | cut -d " " -f 7)
+
+    # Using both permanent and not permanent rules to avoid a firewalld reload.
+    firewall-cmd --zone=public --remove-port=$PORT/$PROTOCOL
+    firewall-cmd --zone=trusted --remove-source=10.8.0.0/24
+}
+
+firewalld_port_close_permanent () {
+    firewall-cmd --permanent --zone=public --remove-port=$PORT/$PROTOCOL
+}
+
+iptables_port_close_until_reboot () {
+    if iptables -L -n | grep -qE '^ACCEPT'; then
+	iptables -D INPUT -p $PROTOCOL --dport $PORT -j ACCEPT
+	iptables -D FORWARD -s 10.8.0.0/24 -j ACCEPT
+	iptables -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+    fi
+}
+
+iptables_port_close_permanent () {
+    if iptables -L -n | grep -qE '^ACCEPT'; then
+	sed -i "/iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT/d" $RCLOCAL
+	sed -i "/iptables -I FORWARD -s 10.8.0.0\/24 -j ACCEPT/d" $RCLOCAL
+	sed -i "/iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT/d" $RCLOCAL
+    fi
+}
+
+firewall_port_close_until_reboot () {
     if firewalld_enabled ; then
-	# Using both permanent and not permanent rules to avoid a firewalld
-	# reload.
-	# We don't use --add-service=openvpn because that would only work with
-	# the default port and protocol.
-	firewall-cmd --zone=public --add-port=$PORT/$PROTOCOL
-	firewall-cmd --zone=trusted --add-source=10.8.0.0/24
-	firewall-cmd --permanent --zone=public --add-port=$PORT/$PROTOCOL
-	firewall-cmd --permanent --zone=trusted --add-source=10.8.0.0/24
+	firewalld_port_close_until_reboot
     else
-	if iptables -L -n | grep -qE '^(REJECT|DROP)'; then
-	    # If iptables has at least one REJECT rule, we asume this is needed.
-	    # Not the best approach but I can't think of other and this shouldn't
-	    # cause problems.
-	    iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT
-	    iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT
-	    iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-	    sed -i "1 a\iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT" $RCLOCAL
-	    sed -i "1 a\iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT" $RCLOCAL
-	    sed -i "1 a\iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" $RCLOCAL
-	fi
+	iptables_port_close_until_reboot
+    fi
+}
+
+firewall_port_close_permanent () {
+    if firewalld_enabled ; then
+	firewalld_port_close_permanent
+    else
+	iptables_port_close_permanent
     fi
 }
 
 firewall_port_close () {
     log firewall_port_close
-    
+
+    firewalld_port_close_until_reboot
+    firewalld_port_close_permanent
+}
+
+# --- NAT enable ----------------------------------------------------------------------
+
+firewalld_nat_enable_until_reboot () {
+    firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 -j SNAT --to $IP
+}
+
+firewalld_nat_enable_permanent () {
+    firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 -j SNAT --to $IP
+}
+
+iptables_nat_enable_until_reboot () {
+    iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j SNAT --to $IP
+}
+
+iptables_nat_enable_permanent () {
+    sed -i "1 a\iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j SNAT --to $IP" $RCLOCAL
+}
+
+firewall_nat_enable_until_reboot () {
     if firewalld_enabled ; then
-	IP=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 -j SNAT --to ' | cut -d " " -f 7)
-	# Using both permanent and not permanent rules to avoid a firewalld reload.
-	firewall-cmd --zone=public --remove-port=$PORT/$PROTOCOL
-	firewall-cmd --zone=trusted --remove-source=10.8.0.0/24
-	firewall-cmd --permanent --zone=public --remove-port=$PORT/$PROTOCOL
+	firewalld_nat_enable_until_reboot
     else
-	if iptables -L -n | grep -qE '^ACCEPT'; then
-	    iptables -D INPUT -p $PROTOCOL --dport $PORT -j ACCEPT
-	    iptables -D FORWARD -s 10.8.0.0/24 -j ACCEPT
-	    iptables -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-	    sed -i "/iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT/d" $RCLOCAL
-	    sed -i "/iptables -I FORWARD -s 10.8.0.0\/24 -j ACCEPT/d" $RCLOCAL
-	    sed -i "/iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT/d" $RCLOCAL
-	fi
+	iptables_nat_enable_until_reboot
+    fi
+}
+
+firewall_nat_enable_permanent () {
+    if firewalld_enabled ; then
+	firewalld_nat_enable_permanent
+    else
+	iptables_nat_enable_permanent
     fi
 }
 
 firewall_nat_enable () {
     log firewall_nat_enable
-    
-    # Set NAT for the VPN subnet
+
+    firewall_nat_enable_until_reboot
+    firewall_nat_enable_permanent
+}
+
+# --- NAT disable ---------------------------------------------------------------------
+
+firewalld_nat_disable_until_reboot () {
+    firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 -j SNAT --to $IP
+}
+
+firewalld_nat_disable_permanent () {
+    firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
+    firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 -j SNAT --to $IP
+}
+
+iptables_nat_disable_until_reboot () {
+    IP=$(grep 'iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j SNAT --to ' $RCLOCAL | cut -d " " -f 11)
+    iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -j SNAT --to $IP
+}
+
+iptables_nat_disable_permenent () {
+    sed -i '/iptables -t nat -A POSTROUTING -s 10.8.0.0\/24 -j SNAT --to /d' $RCLOCAL
+}
+
+firewall_nat_disable_until_reboot () {
     if firewalld_enabled ; then
-	firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 -j SNAT --to $IP
-	firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 -j SNAT --to $IP
+	firewalld_nat_disable_until_reboot
     else
-	iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j SNAT --to $IP
-	sed -i "1 a\iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j SNAT --to $IP" $RCLOCAL
+	iptables_nat_disable_until_reboot
+    fi
+}
+
+firewall_nat_disable_permanent () {
+    if firewalld_enabled ; then
+	firewalld_nat_disable_permanent
+    else
+	iptables_nat_disable_permenent
     fi
 }
 
 firewall_nat_disable () {
     log firewall_nat_disable
-    
-    if firewalld_enabled ; then
-	firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
-	firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 -j SNAT --to $IP
-	firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 -j SNAT --to $IP
-    else
-	IP=$(grep 'iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j SNAT --to ' $RCLOCAL | cut -d " " -f 11)
-	iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -j SNAT --to $IP
-	sed -i '/iptables -t nat -A POSTROUTING -s 10.8.0.0\/24 -j SNAT --to /d' $RCLOCAL
-    fi
+
+    firewall_nat_disable_until_reboot
+    firewall_nat_disable_until_permanent
 }
 
+################################################################################
 # SELinux
+################################################################################
 
 selinux_enforced () {
     if hash sestatus 2>/dev/null; then
@@ -236,7 +365,7 @@ semanage_packages_install () {
 
 selinux_port_open () {
     log selinux_port_open
-    
+
     if selinux_needs_adjustment ; then
        semanage_packages_install
        semanage port -a -t openvpn_port_t -p $PROTOCOL $PORT
@@ -245,13 +374,15 @@ selinux_port_open () {
 
 selinux_port_close () {
     log selinux_port_close
-    
+
     if selinux_needs_adjustment ; then
 	semanage port -d -t openvpn_port_t -p $PROTOCOL $PORT
     fi
 }
 
+################################################################################
 # EasyRSA
+################################################################################
 
 easyrsa_packages_install () {
     case "$OS" in
@@ -267,7 +398,7 @@ easyrsa_packages_install () {
     if [[ -d /etc/openvpn/easy-rsa/ ]]; then
 	rm -rf /etc/openvpn/easy-rsa/
     fi
-    
+
     # Get easy-rsa
     wget -O ~/EasyRSA-3.0.1.tgz "https://github.com/OpenVPN/easy-rsa/releases/download/3.0.1/EasyRSA-3.0.1.tgz"
     tar xzf ~/EasyRSA-3.0.1.tgz -C ~/
@@ -287,57 +418,14 @@ easyrsa_configure () {
     ./easyrsa gen-crl
 }
 
-# OpenVPN - Utilities
-
-openvpn_client_config_generate () {
-    # Generates the custom client.ovpn
-
-    log "openvpn_client_config_generate - $CLIENT - $1"
-    
-    local        name="$CLIENT"
-    local config_path="/root/$name.ovpn"
-    
-    cp /etc/openvpn/client-common.txt $config_path
-
-    echo "<ca>"                                     >> $config_path
-    cat /etc/openvpn/easy-rsa/pki/ca.crt            >> $config_path
-    echo "</ca>"                                    >> $config_path
-
-    echo "<cert>"                                   >> $config_path
-    cat /etc/openvpn/easy-rsa/pki/issued/$name.crt  >> $config_path
-    echo "</cert>"                                  >> $config_path
-
-    echo "<key>"                                    >> $config_path
-    cat /etc/openvpn/easy-rsa/pki/private/$name.key >> $config_path
-    echo "</key>"                                   >> $config_path
-
-    echo "<tls-auth>"                               >> $config_path
-    cat /etc/openvpn/ta.key                         >> $config_path
-    echo "</tls-auth>"                              >> $config_path
+easyrsa_install () {
+    easyrsa_packages_install
+    easyrsa_configure
 }
 
-openvpn_client_add () {
-    log "openvpn_client_add"
-    
-    cd /etc/openvpn/easy-rsa/
-    ./easyrsa build-client-full $CLIENT nopass
-    openvpn_client_config_generate "$CLIENT"
-}
-
-openvpn_client_remove () {
-    cd /etc/openvpn/easy-rsa/
-    ./easyrsa --batch revoke $CLIENT
-    ./easyrsa gen-crl
-    rm -rf pki/reqs/$CLIENT.req
-    rm -rf pki/private/$CLIENT.key
-    rm -rf pki/issued/$CLIENT.crt
-    rm -rf /etc/openvpn/crl.pem
-    cp /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn/crl.pem
-    # CRL is read with each client connection, when OpenVPN is dropped to nobody
-    chown nobody:$GROUPNAME /etc/openvpn/crl.pem
-}
-
-# OpenVPN - Installation
+################################################################################
+# OpenVPN
+################################################################################
 
 openvpn_installed () {
     if [[ -e /etc/openvpn/server.conf ]]; then
@@ -386,7 +474,7 @@ openvpn_server_conf_generate () {
     # Generate server.conf
 
     local path='/etc/openvpn/server.conf'
-    
+
     echo "port $PORT"                    >  $path
     echo "proto $PROTOCOL"               >> $path
     echo "dev tun"                       >> $path
@@ -400,18 +488,18 @@ openvpn_server_conf_generate () {
     echo "topology subnet"               >> $path
     echo "server 10.8.0.0 255.255.255.0" >> $path
     echo "ifconfig-pool-persist ipp.txt" >> $path
-    
+
     echo 'push "redirect-gateway def1 bypass-dhcp"' >> $path
 
     # DNS
     case $DNS in
-	    1) 
+	    1)
 	    # Obtain the resolvers from resolv.conf and use them for OpenVPN
 	    grep -v '#' /etc/resolv.conf | grep 'nameserver' | grep -E -o '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | while read line; do
 		    echo "push \"dhcp-option DNS $line\"" >> $path
 	    done
 	    ;;
-	    2) 
+	    2)
 	    echo 'push "dhcp-option DNS 8.8.8.8"' >> $path
 	    echo 'push "dhcp-option DNS 8.8.4.4"' >> $path
 	    ;;
@@ -419,14 +507,14 @@ openvpn_server_conf_generate () {
 	    echo 'push "dhcp-option DNS 208.67.222.222"' >> $path
 	    echo 'push "dhcp-option DNS 208.67.220.220"' >> $path
 	    ;;
-	    4) 
+	    4)
 	    echo 'push "dhcp-option DNS 129.250.35.250"' >> $path
 	    echo 'push "dhcp-option DNS 129.250.35.251"' >> $path
 	    ;;
-	    5) 
+	    5)
 	    echo 'push "dhcp-option DNS 74.82.42.42"' >> $path
 	    ;;
-	    6) 
+	    6)
 	    echo 'push "dhcp-option DNS 64.6.64.6"' >> $path
 	    echo 'push "dhcp-option DNS 64.6.65.6"' >> $path
 	    ;;
@@ -444,34 +532,13 @@ openvpn_server_conf_generate () {
     echo "crl-verify crl.pem"        >> $path
 }
 
-openvpn_restart () {
-    log openvpn_restart
-    
-    if [[ "$OS" = 'debian' ]]; then
-	# Little hack to check for systemd
-	if pgrep systemd-journal; then
-	    systemctl restart openvpn@server.service
-	else
-	    /etc/init.d/openvpn restart
-	fi
-    else
-	if pgrep systemd-journal; then
-	    systemctl restart openvpn@server.service
-	    systemctl enable openvpn@server.service
-	else
-	    service openvpn restart
-	    chkconfig openvpn on
-	fi
-    fi
-}
-
 openvpn_client_template_create () {
     log openvpn_client_template_create
-    
+
     # client-common.txt is created so we have a template to add further users later
 
     local path='/etc/openvpn/client-common.txt'
-    
+
     echo "client"                       >  $path
     echo "dev tun"                      >> $path
     echo "proto $PROTOCOL"              >> $path
@@ -490,44 +557,118 @@ openvpn_client_template_create () {
     echo "verb 3"                       >> $path
 }
 
+openvpn_client_config_generate () {
+    # Generates the custom client.ovpn
+
+    log "openvpn_client_config_generate - $CLIENT - $1"
+
+    local        name="$CLIENT"
+    local config_path="/root/$name.ovpn"
+
+    cp /etc/openvpn/client-common.txt $config_path
+
+    echo "<ca>"                                     >> $config_path
+    cat /etc/openvpn/easy-rsa/pki/ca.crt            >> $config_path
+    echo "</ca>"                                    >> $config_path
+
+    echo "<cert>"                                   >> $config_path
+    cat /etc/openvpn/easy-rsa/pki/issued/$name.crt  >> $config_path
+    echo "</cert>"                                  >> $config_path
+
+    echo "<key>"                                    >> $config_path
+    cat /etc/openvpn/easy-rsa/pki/private/$name.key >> $config_path
+    echo "</key>"                                   >> $config_path
+
+    echo "<tls-auth>"                               >> $config_path
+    cat /etc/openvpn/ta.key                         >> $config_path
+    echo "</tls-auth>"                              >> $config_path
+}
+
+openvpn_restart () {
+    log openvpn_restart
+
+    if [[ "$OS" = 'debian' ]]; then
+	# Little hack to check for systemd
+	if pgrep systemd-journal; then
+	    systemctl restart openvpn@server.service
+	else
+	    /etc/init.d/openvpn restart
+	fi
+    else
+	if pgrep systemd-journal; then
+	    systemctl restart openvpn@server.service
+	    systemctl enable openvpn@server.service
+	else
+	    service openvpn restart
+	    chkconfig openvpn on
+	fi
+    fi
+}
+
 openvpn_configure () {
     openvpn_certificates_copy
     openvpn_tls_auth_key_generate
     openvpn_server_conf_generate
     openvpn_client_template_create
-    
+
     rclocal_create
     firewall_ip_forwarding_enable
     firewall_port_open
     firewall_nat_enable
-    
+
     selinux_port_open
 }
 
-openvpn_install () {   
+# --- Public functions ---------------------------------------------------------
+
+openvpn_install () {
     openvpn_packages_install
 
-    easyrsa_packages_install
-    easyrsa_configure
+    easyrsa_install
 
     openvpn_configure
     openvpn_restart
 }
 
 openvpn_remove () {
-    PORT=$(grep '^port ' /etc/openvpn/server.conf | cut -d " " -f 2)
-    PROTOCOL=$(grep '^proto ' /etc/openvpn/server.conf | cut -d " " -f 2)
-
     firewall_port_close
     firewall_nat_disable
-    
+
     openvpn_packages_remove
-    
+
     rm -rf /etc/openvpn
     rm -rf /usr/share/doc/openvpn*
 }
 
-# OpenVPN - Interactive install helpers
+openvpn_client_add () {
+    log "openvpn_client_add"
+
+    cd /etc/openvpn/easy-rsa/
+    ./easyrsa build-client-full $CLIENT nopass
+    openvpn_client_config_generate "$CLIENT"
+}
+
+openvpn_client_remove () {
+    cd /etc/openvpn/easy-rsa/
+
+    ./easyrsa --batch revoke $CLIENT
+
+    rm -rf pki/reqs/$CLIENT.req
+    rm -rf pki/private/$CLIENT.key
+    rm -rf pki/issued/$CLIENT.crt
+
+    ./easyrsa gen-crl
+    rm -rf /etc/openvpn/crl.pem
+    cp /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn/crl.pem
+    # CRL is read with each client connection, when OpenVPN is dropped to nobody
+    chown nobody:$GROUPNAME /etc/openvpn/crl.pem
+}
+
+################################################################################
+# Menu-based interface
+################################################################################
+
+# --- Helpers ------------------------------------------------------------------
 
 show_preinstall_note () {
     clear
@@ -584,22 +725,25 @@ get_dns () {
 }
 
 get_external_ip_address () {
+    local external_ip
+    local user_external_ip
+
     # Try to detect a NATed connection and ask about it to potential LowEndSpirit users
-    EXTERNALIP=$(wget -4qO- "http://whatismyip.akamai.com/")
-    if [[ "$IP" != "$EXTERNALIP" ]]; then
+    external_ip=$(wget -4qO- "http://whatismyip.akamai.com/")
+    if [[ "$IP" != "$external_ip" ]]; then
 	    echo ""
 	    echo "Looks like your server is behind a NAT!"
 	    echo ""
 	    echo "If your server is NATed (e.g. LowEndSpirit), I need to know the external IP"
 	    echo "If that's not the case, just ignore this and leave the next field blank"
-	    read -p "External IP: " -e USEREXTERNALIP
-	    if [[ "$USEREXTERNALIP" != "" ]]; then
-		    IP=$USEREXTERNALIP
+	    read -p "External IP: " -e user_external_ip
+	    if [[ "$user_external_ip" != "" ]]; then
+		    IP=$user_external_ip
 	    fi
     fi
 }
 
-# Interactive 
+# --- Menu entries -------------------------------------------------------------
 
 interactive_openvpn_install () {
     show_preinstall_note
@@ -614,7 +758,7 @@ interactive_openvpn_install () {
     read -n1 -r -p "Press any key to continue..."
 
     openvpn_install
-    
+
     interactive_client_add
 
     show_postinstall_note
@@ -624,7 +768,12 @@ interactive_openvpn_remove () {
     echo ""
     read -p "Do you really want to remove OpenVPN? [y/n]: " -e -i n REMOVE
     if [[ "$REMOVE" = 'y' ]]; then
+
+	    PORT=$(grep '^port '  /etc/openvpn/server.conf | cut -d " " -f 2)
+	PROTOCOL=$(grep '^proto ' /etc/openvpn/server.conf | cut -d " " -f 2)
+
 	openvpn_remove
+
 	echo ""
 	echo "OpenVPN removed!"
     else
@@ -646,8 +795,11 @@ interactive_client_add () {
 }
 
 interactive_client_remove () {
-    NUMBEROFCLIENTS=$(tail -n +2 /etc/openvpn/easy-rsa/pki/index.txt | grep -c "^V")
-    if [[ "$NUMBEROFCLIENTS" = '0' ]]; then
+    local number_of_clients
+    local client_number
+
+    number_of_clients=$(tail -n +2 /etc/openvpn/easy-rsa/pki/index.txt | grep -c "^V")
+    if [[ "$number_of_clients" = '0' ]]; then
 	echo ""
 	echo "You have no existing clients!"
 	exit 6
@@ -655,12 +807,13 @@ interactive_client_remove () {
     echo ""
     echo "Select the existing client certificate you want to revoke"
     tail -n +2 /etc/openvpn/easy-rsa/pki/index.txt | grep "^V" | cut -d '=' -f 2 | nl -s ') '
-    if [[ "$NUMBEROFCLIENTS" = '1' ]]; then
-	read -p "Select one client [1]: " CLIENTNUMBER
+    if [[ "$number_of_clients" = '1' ]]; then
+	read -p "Select one client [1]: " client_number
     else
-	read -p "Select one client [1-$NUMBEROFCLIENTS]: " CLIENTNUMBER
+	read -p "Select one client [1-$number_of_clients]: " client_number
     fi
-    CLIENT=$(tail -n +2 /etc/openvpn/easy-rsa/pki/index.txt | grep "^V" | cut -d '=' -f 2 | sed -n "$CLIENTNUMBER"p)
+
+    CLIENT=$(tail -n +2 /etc/openvpn/easy-rsa/pki/index.txt | grep "^V" | cut -d '=' -f 2 | sed -n "$client_number"p)
 
     openvpn_client_remove
 
@@ -668,7 +821,11 @@ interactive_client_remove () {
     echo "Certificate for client $CLIENT revoked"
 }
 
+# --- Menu ---------------------------------------------------------------------
+
 interactive_menu () {
+    local option
+
     clear
     echo "Looks like OpenVPN is already installed"
     echo ""
@@ -678,6 +835,7 @@ interactive_menu () {
     echo "   3) Remove OpenVPN"
     echo "   4) Exit"
     read -p "Select an option [1-4]: " option
+
     case $option in
 	1) interactive_client_add     ;;
 	2) interactive_client_remove  ;;
@@ -688,7 +846,11 @@ interactive_menu () {
     exit 0
 }
 
-detect_linux_distribution 
+################################################################################
+# Initialization
+################################################################################
+
+detect_linux_distribution
 check_environment
 setup_variables
 
